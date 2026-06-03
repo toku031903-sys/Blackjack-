@@ -1,0 +1,1024 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+
+<meta property="og:title" content="ブラックジャック">
+<meta property="og:description" content="2〜6人で遊べるカードゲーム">
+<meta property="og:image" content="https://toku031903-sys.github.io/Blackjack-/ogp.png">
+<meta property="og:url" content="https://toku031903-sys.github.io/Blackjack-/IMG_0979.jpeg">
+<meta property="og:type" content="website">
+
+<title>BlackJack Online</title>
+<link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@400;700;900&family=Crimson+Pro:ital,wght@0,300;0,400;1,300&display=swap" rel="stylesheet">
+
+<!-- Firebase SDK -->
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+  import { getDatabase, ref, set, get, onValue, update, push, remove, off } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
+
+  // ====== FIREBASE CONFIG: ここに自分のFirebaseの設定を入れてください ======
+  const firebaseConfig = {
+  apiKey: "AIzaSyC8598WYSNoDqDF7z7W5Wi7aNTO1e77zwA",
+  authDomain: "blackjack-746a3.firebaseapp.com",
+  projectId: "blackjack-746a3",
+  storageBucket: "blackjack-746a3.firebasestorage.app",
+  messagingSenderId: "798294757799",
+  appId: "1:798294757799:web:a227cfe4b674f359f4e682",
+  measurementId: "G-ZSJT9K7NGM"
+};
+  // ======================================================================
+
+  const app = initializeApp(firebaseConfig);
+  const db = getDatabase(app);
+
+  // =========== カード・ゲームロジック ===========
+  const SUITS = ['♠','♥','♦','♣'];
+  const RANKS = ['A','2','3','4','5','6','7','8','9','10','J','Q','K'];
+
+  function createDeck() {
+    const deck = [];
+    for (const suit of SUITS) {
+      for (const rank of RANKS) {
+        deck.push({ suit, rank });
+      }
+    }
+    return shuffleDeck(deck);
+  }
+
+  function shuffleDeck(deck) {
+    const d = [...deck];
+    for (let i = d.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [d[i], d[j]] = [d[j], d[i]];
+    }
+    return d;
+  }
+
+  function cardValue(card) {
+    if (['J','Q','K'].includes(card.rank)) return 10;
+    if (card.rank === 'A') return 11;
+    return parseInt(card.rank);
+  }
+
+  function calcScore(hand) {
+    let score = 0, aces = 0;
+    for (const c of hand) {
+      score += cardValue(c);
+      if (c.rank === 'A') aces++;
+    }
+    while (score > 21 && aces > 0) { score -= 10; aces--; }
+    return score;
+  }
+
+  function isBlackjack(hand) {
+    return hand.length === 2 && calcScore(hand) === 21;
+  }
+
+  // =========== グローバル状態 ===========
+  let roomId = null;
+  let myPlayerId = null;
+  let myName = null;
+  let roomRef = null;
+  let unsubscribes = [];
+  let localGameState = null;
+
+  // =========== UI ヘルパー ===========
+  const $ = id => document.getElementById(id);
+  const show = id => $(id).classList.remove('hidden');
+  const hide = id => $(id).classList.add('hidden');
+
+  function setStatus(msg, type='info') {
+    const el = $('status-msg');
+    el.textContent = msg;
+    el.className = 'status-msg ' + type;
+  }
+
+  function suitColor(suit) {
+    return (suit === '♥' || suit === '♦') ? '#e85d5d' : '#f0e6d3';
+  }
+
+  function renderCard(card, hidden=false) {
+    if (hidden) {
+      return `<div class="card card-back"><div class="card-back-inner"></div></div>`;
+    }
+    const color = suitColor(card.suit);
+    return `
+      <div class="card" style="--suit-color:${color}">
+        <div class="card-rank-top">${card.rank}</div>
+        <div class="card-suit-center">${card.suit}</div>
+        <div class="card-rank-bottom">${card.rank}</div>
+      </div>`;
+  }
+
+  function renderHand(hand, hiddenCount=0, score=null) {
+    let html = '<div class="hand-cards">';
+    for (let i = 0; i < hand.length; i++) {
+      html += renderCard(hand[i], i < hiddenCount);
+    }
+    html += '</div>';
+    if (score !== null) {
+      html += `<div class="score-badge">${score}</div>`;
+    }
+    return html;
+  }
+
+  // =========== ルーム作成 ===========
+  async function createRoom() {
+    myName = $('player-name').value.trim();
+    if (!myName) { setStatus('名前を入力してください', 'error'); return; }
+
+    myPlayerId = 'p_' + Math.random().toString(36).substr(2,8);
+    const newRoomRef = push(ref(db, 'rooms'));
+    roomId = newRoomRef.key;
+    roomRef = newRoomRef;
+
+    const roomData = {
+      host: myPlayerId,
+      status: 'waiting',
+      players: {
+        [myPlayerId]: { name: myName, order: 0, status: 'waiting' }
+      },
+      createdAt: Date.now()
+    };
+
+    await set(newRoomRef, roomData);
+    $('room-id-display').textContent = roomId;
+    show('room-id-section');
+    hide('create-room-btn');
+    hide('join-section');
+    setStatus('友達を待っています...', 'info');
+    listenRoom();
+  }
+
+  // =========== ルーム参加 ===========
+  async function joinRoom() {
+    myName = $('player-name').value.trim();
+    const code = $('room-code-input').value.trim();
+    if (!myName) { setStatus('名前を入力してください', 'error'); return; }
+    if (!code) { setStatus('ルームIDを入力してください', 'error'); return; }
+
+    myPlayerId = 'p_' + Math.random().toString(36).substr(2,8);
+    roomId = code;
+    roomRef = ref(db, 'rooms/' + roomId);
+
+    const snap = await get(roomRef);
+    if (!snap.exists()) { setStatus('ルームが見つかりません', 'error'); return; }
+    const room = snap.val();
+    if (room.status !== 'waiting') { setStatus('このルームはすでにゲーム中です', 'error'); return; }
+
+    const playerCount = Object.keys(room.players || {}).length;
+    if (playerCount >= 4) { setStatus('満員です', 'error'); return; }
+
+    await update(ref(db, `rooms/${roomId}/players/${myPlayerId}`), {
+      name: myName, order: playerCount, status: 'waiting'
+    });
+
+    setStatus('参加しました！ゲーム開始を待っています...', 'info');
+    listenRoom();
+  }
+
+  // =========== ルーム監視 ===========
+  function listenRoom() {
+    hide('lobby');
+    show('game-screen');
+
+    const unsub = onValue(roomRef, snap => {
+      if (!snap.exists()) return;
+      localGameState = snap.val();
+      renderGameScreen(localGameState);
+    });
+    unsubscribes.push(() => off(roomRef));
+  }
+
+  // =========== ゲーム開始（ホストのみ） ===========
+  async function startGame() {
+    const snap = await get(roomRef);
+    const room = snap.val();
+    if (room.host !== myPlayerId) { setStatus('ホストのみ開始できます', 'error'); return; }
+
+    const players = room.players;
+    const playerIds = Object.keys(players).sort((a,b) => players[a].order - players[b].order);
+    if (playerIds.length < 2) { setStatus('2人以上必要です', 'error'); return; }
+
+    const deck = createDeck();
+    // 各プレイヤーに2枚配る
+    const hands = {};
+    let deckIdx = 0;
+    for (const pid of playerIds) {
+      hands[pid] = [deck[deckIdx++], deck[deckIdx++]];
+    }
+    // ディーラーに2枚（1枚は裏）
+    const dealerHand = [deck[deckIdx++], deck[deckIdx++]];
+    const remainingDeck = deck.slice(deckIdx);
+
+    const gameData = {
+      status: 'playing',
+      deck: remainingDeck,
+      dealerHand: dealerHand,
+      hands: hands,
+      playerOrder: playerIds,
+      currentTurnIndex: 0,
+      playerStatuses: {},
+      results: null
+    };
+
+    for (const pid of playerIds) {
+      gameData.playerStatuses[pid] = 'playing';
+    }
+
+    await update(roomRef, gameData);
+  }
+
+  // =========== ヒット ===========
+  async function hit() {
+    if (!canAct()) return;
+    const state = localGameState;
+    const deck = [...state.deck];
+    const card = deck.shift();
+    const newHand = [...state.hands[myPlayerId], card];
+    const score = calcScore(newHand);
+
+    const updates = {
+      [`deck`]: deck,
+      [`hands/${myPlayerId}`]: newHand,
+    };
+
+    if (score > 21) {
+      updates[`playerStatuses/${myPlayerId}`] = 'bust';
+      await update(roomRef, updates);
+      await advanceTurn(state);
+    } else if (score === 21) {
+      updates[`playerStatuses/${myPlayerId}`] = 'stand';
+      await update(roomRef, updates);
+      await advanceTurn(state);
+    } else {
+      await update(roomRef, updates);
+    }
+  }
+
+  // =========== スタンド ===========
+  async function stand() {
+    if (!canAct()) return;
+    await update(roomRef, {
+      [`playerStatuses/${myPlayerId}`]: 'stand'
+    });
+    await advanceTurn(localGameState);
+  }
+
+  function canAct() {
+    if (!localGameState) return false;
+    const { playerOrder, currentTurnIndex, playerStatuses } = localGameState;
+    if (!playerOrder) return false;
+    const currentPid = playerOrder[currentTurnIndex];
+    return currentPid === myPlayerId && playerStatuses[myPlayerId] === 'playing';
+  }
+
+  // =========== ターン進行 ===========
+  async function advanceTurn(state) {
+    const { playerOrder, currentTurnIndex } = state;
+    let nextIndex = currentTurnIndex + 1;
+
+    // 次のアクティブプレイヤーを探す
+    while (nextIndex < playerOrder.length) {
+      const pid = playerOrder[nextIndex];
+      const st = state.playerStatuses[pid];
+      if (st === 'playing') break;
+      nextIndex++;
+    }
+
+    if (nextIndex >= playerOrder.length) {
+      // 全員終了 → ディーラーターン
+      await dealerTurn(state);
+    } else {
+      await update(roomRef, { currentTurnIndex: nextIndex });
+    }
+  }
+
+  // =========== ディーラーターン ===========
+  async function dealerTurn(state) {
+    let dealerHand = [...state.dealerHand];
+    let deck = [...state.deck];
+
+    // ディーラーは17以上になるまでヒット
+    while (calcScore(dealerHand) < 17) {
+      dealerHand.push(deck.shift());
+    }
+
+    const dealerScore = calcScore(dealerHand);
+    const dealerBust = dealerScore > 21;
+
+    // 結果計算
+    const results = {};
+    for (const pid of state.playerOrder) {
+      const hand = state.hands[pid];
+      const playerScore = calcScore(hand);
+      const playerBust = state.playerStatuses[pid] === 'bust';
+      const playerBJ = isBlackjack(hand);
+      const dealerBJ = isBlackjack(state.dealerHand);
+
+      let result;
+      if (playerBust) {
+        result = 'lose';
+      } else if (dealerBust) {
+        result = 'win';
+      } else if (playerBJ && !dealerBJ) {
+        result = 'blackjack';
+      } else if (!playerBJ && dealerBJ) {
+        result = 'lose';
+      } else if (playerScore > dealerScore) {
+        result = 'win';
+      } else if (playerScore < dealerScore) {
+        result = 'lose';
+      } else {
+        result = 'push';
+      }
+      results[pid] = result;
+    }
+
+    await update(roomRef, {
+      status: 'finished',
+      dealerHand: dealerHand,
+      deck: deck,
+      results: results,
+      currentTurnIndex: state.playerOrder.length
+    });
+  }
+
+  // =========== 再戦 ===========
+  async function playAgain() {
+    if (localGameState.host !== myPlayerId) {
+      setStatus('ホストが再戦を開始するのを待ってください...', 'info');
+      return;
+    }
+
+    const snap = await get(roomRef);
+    const room = snap.val();
+    const players = room.players;
+    const playerIds = Object.keys(players).sort((a,b) => players[a].order - players[b].order);
+
+    const deck = createDeck();
+    const hands = {};
+    let deckIdx = 0;
+    for (const pid of playerIds) {
+      hands[pid] = [deck[deckIdx++], deck[deckIdx++]];
+    }
+    const dealerHand = [deck[deckIdx++], deck[deckIdx++]];
+    const remainingDeck = deck.slice(deckIdx);
+
+    const playerStatuses = {};
+    for (const pid of playerIds) { playerStatuses[pid] = 'playing'; }
+
+    await update(roomRef, {
+      status: 'playing',
+      deck: remainingDeck,
+      dealerHand: dealerHand,
+      hands: hands,
+      playerOrder: playerIds,
+      currentTurnIndex: 0,
+      playerStatuses: playerStatuses,
+      results: null
+    });
+  }
+
+  // =========== 画面描画 ===========
+  function renderGameScreen(state) {
+    const { status, players, host, playerOrder, currentTurnIndex, hands, dealerHand, playerStatuses, results } = state;
+    const isHost = host === myPlayerId;
+
+    // ディーラーエリア
+    const dealerArea = $('dealer-area');
+    if (dealerHand) {
+      const finished = status === 'finished';
+      const hiddenCount = finished ? 0 : 1;
+      const dealerScore = finished ? calcScore(dealerHand) : calcScore([dealerHand[1]]); 
+      dealerArea.innerHTML = `
+        <div class="area-label">🤖 ディーラー</div>
+        ${renderHand(dealerHand, hiddenCount, finished ? dealerScore : '?')}
+      `;
+    }
+
+    // 自分の手札
+    const myArea = $('my-area');
+    if (hands && hands[myPlayerId]) {
+      const myHand = hands[myPlayerId];
+      const myScore = calcScore(myHand);
+      const myStatus = playerStatuses ? playerStatuses[myPlayerId] : 'playing';
+
+      let resultBadge = '';
+      if (results && results[myPlayerId]) {
+        const r = results[myPlayerId];
+        const rMap = { win:'🎉 WIN', blackjack:'⭐ BLACKJACK!', lose:'💀 LOSE', push:'🤝 PUSH' };
+        const rClass = { win:'result-win', blackjack:'result-bj', lose:'result-lose', push:'result-push' };
+        resultBadge = `<div class="result-badge ${rClass[r]}">${rMap[r]}</div>`;
+      }
+
+      const statusLabel = myStatus === 'bust' ? '<span class="bust-label">BUST!</span>' : '';
+
+      myArea.innerHTML = `
+        <div class="area-label">👤 あなた (${myName}) ${statusLabel}</div>
+        ${renderHand(myHand, 0, myScore)}
+        ${resultBadge}
+      `;
+    }
+
+    // 他プレイヤーエリア
+    const othersArea = $('others-area');
+    othersArea.innerHTML = '';
+    if (playerOrder && players) {
+      for (const pid of playerOrder) {
+        if (pid === myPlayerId) continue;
+        const pName = players[pid]?.name || pid;
+        const pStatus = playerStatuses ? playerStatuses[pid] : '?';
+        const pHand = hands ? hands[pid] : null;
+        const isCurrent = playerOrder[currentTurnIndex] === pid && status === 'playing';
+
+        let resultBadge = '';
+        if (results && results[pid]) {
+          const r = results[pid];
+          const rMap = { win:'WIN', blackjack:'BLACKJACK!', lose:'LOSE', push:'PUSH' };
+          resultBadge = `<span class="other-result">${rMap[r]}</span>`;
+        }
+
+        let cardCountStr = pHand ? `${pHand.length}枚` : '';
+        // 他プレイヤーのカードは枚数だけ表示（裏向きで）
+        let hiddenCardsHtml = '';
+        if (pHand && status !== 'finished') {
+          hiddenCardsHtml = '<div class="hand-cards">';
+          for (let i = 0; i < pHand.length; i++) {
+            hiddenCardsHtml += renderCard(pHand[i], true);
+          }
+          hiddenCardsHtml += '</div>';
+        } else if (pHand && status === 'finished') {
+          const pScore = calcScore(pHand);
+          hiddenCardsHtml = renderHand(pHand, 0, pScore);
+        }
+
+        const bustLabel = pStatus === 'bust' ? '<span class="bust-label">BUST!</span>' : '';
+        const standLabel = pStatus === 'stand' ? '<span class="stand-label">STAND</span>' : '';
+
+        othersArea.innerHTML += `
+          <div class="other-player ${isCurrent ? 'current-turn' : ''}">
+            <div class="area-label">👤 ${pName} ${bustLabel}${standLabel} ${resultBadge}</div>
+            ${hiddenCardsHtml}
+          </div>
+        `;
+      }
+    }
+
+    // アクションボタン
+    const actionArea = $('action-area');
+    if (status === 'playing') {
+      const myTurn = playerOrder && playerOrder[currentTurnIndex] === myPlayerId
+                     && playerStatuses && playerStatuses[myPlayerId] === 'playing';
+      const currentName = playerOrder && players ? (players[playerOrder[currentTurnIndex]]?.name || '') : '';
+
+      if (myTurn) {
+        actionArea.innerHTML = `
+          <div class="your-turn-msg">あなたのターン！</div>
+          <div class="btn-row">
+            <button class="btn btn-hit" onclick="window._hit()">ヒット</button>
+            <button class="btn btn-stand" onclick="window._stand()">スタンド</button>
+          </div>
+        `;
+      } else {
+        actionArea.innerHTML = `<div class="waiting-msg">⏳ ${currentName} のターンを待っています...</div>`;
+      }
+    } else if (status === 'waiting') {
+      const pCount = playerOrder ? playerOrder.length : (players ? Object.keys(players).length : 0);
+      if (isHost) {
+        actionArea.innerHTML = `
+          <div class="waiting-msg">参加者: ${pCount}人</div>
+          <button class="btn btn-start" onclick="window._startGame()">ゲーム開始</button>
+        `;
+      } else {
+        actionArea.innerHTML = `<div class="waiting-msg">⏳ ホストがゲームを開始するのを待っています... (${pCount}人参加中)</div>`;
+      }
+    } else if (status === 'finished') {
+      const myResult = results ? results[myPlayerId] : null;
+      actionArea.innerHTML = `
+        <div class="game-over-msg">ゲーム終了！</div>
+        ${isHost
+          ? `<button class="btn btn-start" onclick="window._playAgain()">もう一度</button>`
+          : `<div class="waiting-msg">ホストが再戦を開始するのを待っています...</div>`
+        }
+      `;
+    }
+
+    // ルームID表示
+    $('room-id-header').textContent = 'Room: ' + (roomId || '');
+  }
+
+  // グローバル公開
+  window._createRoom = createRoom;
+  window._joinRoom = joinRoom;
+  window._startGame = startGame;
+  window._hit = hit;
+  window._stand = stand;
+  window._playAgain = playAgain;
+  window._copyRoomId = () => {
+    const id = $('room-id-display').textContent;
+    navigator.clipboard.writeText(id).then(() => setStatus('ルームIDをコピーしました！', 'success'));
+  };
+</script>
+
+<style>
+  :root {
+    --green: #1a4a2e;
+    --green-light: #2d6b45;
+    --gold: #c9a84c;
+    --gold-light: #e8c96c;
+    --cream: #f0e6d3;
+    --red: #e85d5d;
+    --dark: #0d1f15;
+    --card-bg: #faf6ee;
+    --shadow: 0 8px 32px rgba(0,0,0,0.5);
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+
+  body {
+    font-family: 'Crimson Pro', Georgia, serif;
+    background: var(--dark);
+    color: var(--cream);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    overflow-x: hidden;
+    background-image:
+      radial-gradient(ellipse at 20% 50%, rgba(26,74,46,0.4) 0%, transparent 60%),
+      radial-gradient(ellipse at 80% 20%, rgba(201,168,76,0.1) 0%, transparent 50%),
+      repeating-linear-gradient(
+        45deg,
+        transparent,
+        transparent 20px,
+        rgba(255,255,255,0.01) 20px,
+        rgba(255,255,255,0.01) 21px
+      );
+  }
+
+  /* ===== HEADER ===== */
+  .header {
+    width: 100%;
+    background: linear-gradient(180deg, rgba(0,0,0,0.8) 0%, transparent 100%);
+    padding: 12px 16px 8px;
+    text-align: center;
+    border-bottom: 1px solid rgba(201,168,76,0.2);
+  }
+
+  .header h1 {
+    font-family: 'Cinzel', serif;
+    font-size: 22px;
+    font-weight: 900;
+    letter-spacing: 4px;
+    background: linear-gradient(135deg, var(--gold) 0%, var(--gold-light) 50%, var(--gold) 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    text-shadow: none;
+  }
+
+  .room-id-header {
+    font-size: 11px;
+    color: rgba(201,168,76,0.6);
+    letter-spacing: 2px;
+    margin-top: 2px;
+    font-family: 'Cinzel', serif;
+  }
+
+  /* ===== LOBBY ===== */
+  .lobby-container {
+    width: 100%;
+    max-width: 420px;
+    padding: 24px 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+    flex: 1;
+    justify-content: center;
+  }
+
+  .lobby-title {
+    font-family: 'Cinzel', serif;
+    font-size: 13px;
+    letter-spacing: 3px;
+    color: var(--gold);
+    text-align: center;
+    text-transform: uppercase;
+  }
+
+  .card-decor {
+    display: flex;
+    justify-content: center;
+    gap: 8px;
+    font-size: 40px;
+    margin: 8px 0;
+  }
+
+  .input-field {
+    background: rgba(255,255,255,0.05);
+    border: 1px solid rgba(201,168,76,0.3);
+    border-radius: 8px;
+    padding: 14px 16px;
+    font-size: 16px;
+    color: var(--cream);
+    font-family: 'Crimson Pro', serif;
+    width: 100%;
+    outline: none;
+    transition: border-color 0.2s;
+  }
+
+  .input-field:focus { border-color: var(--gold); background: rgba(201,168,76,0.07); }
+  .input-field::placeholder { color: rgba(240,230,211,0.3); }
+
+  .divider {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    color: rgba(201,168,76,0.4);
+    font-size: 12px;
+    letter-spacing: 2px;
+  }
+
+  .divider::before, .divider::after {
+    content: '';
+    flex: 1;
+    height: 1px;
+    background: rgba(201,168,76,0.2);
+  }
+
+  /* ===== BUTTONS ===== */
+  .btn {
+    border: none;
+    border-radius: 8px;
+    font-family: 'Cinzel', serif;
+    font-size: 14px;
+    letter-spacing: 2px;
+    cursor: pointer;
+    transition: all 0.15s;
+    padding: 14px 20px;
+    width: 100%;
+    font-weight: 700;
+  }
+
+  .btn:active { transform: scale(0.97); }
+
+  .btn-primary {
+    background: linear-gradient(135deg, #b8922a 0%, var(--gold-light) 50%, #b8922a 100%);
+    color: #1a0f00;
+  }
+
+  .btn-secondary {
+    background: rgba(201,168,76,0.1);
+    color: var(--gold);
+    border: 1px solid rgba(201,168,76,0.4);
+  }
+
+  .btn-hit {
+    background: linear-gradient(135deg, #1a6b3a 0%, #2d9b57 100%);
+    color: #fff;
+    flex: 1;
+    font-size: 16px;
+    padding: 18px;
+  }
+
+  .btn-stand {
+    background: linear-gradient(135deg, #6b1a1a 0%, #c03030 100%);
+    color: #fff;
+    flex: 1;
+    font-size: 16px;
+    padding: 18px;
+  }
+
+  .btn-start {
+    background: linear-gradient(135deg, #b8922a 0%, var(--gold-light) 100%);
+    color: #1a0f00;
+    font-size: 16px;
+    padding: 18px;
+  }
+
+  .btn-row { display: flex; gap: 12px; }
+
+  /* ===== STATUS ===== */
+  .status-msg {
+    text-align: center;
+    padding: 10px 16px;
+    border-radius: 8px;
+    font-size: 14px;
+    background: rgba(255,255,255,0.05);
+    border: 1px solid rgba(255,255,255,0.1);
+    min-height: 40px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .status-msg.error { border-color: var(--red); color: var(--red); background: rgba(232,93,93,0.1); }
+  .status-msg.success { border-color: var(--gold); color: var(--gold); background: rgba(201,168,76,0.1); }
+
+  .room-id-section {
+    background: rgba(201,168,76,0.08);
+    border: 1px solid rgba(201,168,76,0.3);
+    border-radius: 10px;
+    padding: 16px;
+    text-align: center;
+  }
+
+  .room-id-label { font-size: 11px; letter-spacing: 2px; color: var(--gold); font-family: 'Cinzel', serif; margin-bottom: 6px; }
+  .room-id-code { font-size: 18px; font-family: 'Cinzel', serif; color: var(--cream); letter-spacing: 3px; margin-bottom: 10px; }
+
+  /* ===== GAME SCREEN ===== */
+  .game-screen {
+    width: 100%;
+    max-width: 480px;
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    padding: 0 12px 12px;
+    gap: 10px;
+  }
+
+  .game-area {
+    background: rgba(26,74,46,0.3);
+    border: 1px solid rgba(201,168,76,0.15);
+    border-radius: 12px;
+    padding: 14px;
+    min-height: 120px;
+  }
+
+  .area-label {
+    font-family: 'Cinzel', serif;
+    font-size: 11px;
+    letter-spacing: 2px;
+    color: rgba(201,168,76,0.7);
+    margin-bottom: 10px;
+    text-transform: uppercase;
+  }
+
+  /* ===== CARDS ===== */
+  .hand-cards {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: flex-start;
+  }
+
+  .card {
+    width: 52px;
+    height: 76px;
+    background: var(--card-bg);
+    border-radius: 6px;
+    position: relative;
+    box-shadow: 2px 3px 8px rgba(0,0,0,0.4), inset 0 0 0 1px rgba(0,0,0,0.1);
+    flex-shrink: 0;
+    animation: dealCard 0.3s ease-out;
+  }
+
+  @keyframes dealCard {
+    from { transform: translateY(-20px) rotate(-5deg); opacity: 0; }
+    to { transform: none; opacity: 1; }
+  }
+
+  .card-rank-top {
+    position: absolute;
+    top: 4px; left: 5px;
+    font-family: 'Cinzel', serif;
+    font-weight: 700;
+    font-size: 13px;
+    color: var(--suit-color);
+    line-height: 1;
+  }
+
+  .card-suit-center {
+    position: absolute;
+    top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    font-size: 22px;
+    color: var(--suit-color);
+  }
+
+  .card-rank-bottom {
+    position: absolute;
+    bottom: 4px; right: 5px;
+    font-family: 'Cinzel', serif;
+    font-weight: 700;
+    font-size: 13px;
+    color: var(--suit-color);
+    line-height: 1;
+    transform: rotate(180deg);
+  }
+
+  .card-back {
+    background: linear-gradient(135deg, #1a4a2e 0%, #0d2b1a 100%);
+  }
+
+  .card-back-inner {
+    position: absolute;
+    inset: 5px;
+    border: 1px solid rgba(201,168,76,0.4);
+    border-radius: 3px;
+    background:
+      repeating-linear-gradient(45deg, rgba(201,168,76,0.08) 0px, rgba(201,168,76,0.08) 1px, transparent 1px, transparent 8px),
+      repeating-linear-gradient(-45deg, rgba(201,168,76,0.08) 0px, rgba(201,168,76,0.08) 1px, transparent 1px, transparent 8px);
+  }
+
+  .score-badge {
+    display: inline-block;
+    margin-top: 8px;
+    background: rgba(0,0,0,0.5);
+    border: 1px solid rgba(201,168,76,0.3);
+    border-radius: 20px;
+    padding: 2px 12px;
+    font-family: 'Cinzel', serif;
+    font-size: 14px;
+    color: var(--gold-light);
+    letter-spacing: 1px;
+  }
+
+  /* ===== RESULT ===== */
+  .result-badge {
+    margin-top: 10px;
+    display: inline-block;
+    padding: 6px 20px;
+    border-radius: 20px;
+    font-family: 'Cinzel', serif;
+    font-size: 15px;
+    font-weight: 700;
+    letter-spacing: 2px;
+    animation: popIn 0.4s cubic-bezier(0.34,1.56,0.64,1);
+  }
+
+  @keyframes popIn {
+    from { transform: scale(0.5); opacity: 0; }
+    to { transform: scale(1); opacity: 1; }
+  }
+
+  .result-win { background: rgba(45,155,87,0.3); border: 1px solid #2d9b57; color: #6ee899; }
+  .result-bj { background: rgba(201,168,76,0.3); border: 1px solid var(--gold); color: var(--gold-light); }
+  .result-lose { background: rgba(232,93,93,0.2); border: 1px solid var(--red); color: #ff9999; }
+  .result-push { background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.3); color: #ccc; }
+
+  /* ===== OTHERS ===== */
+  .other-player {
+    background: rgba(0,0,0,0.2);
+    border: 1px solid rgba(255,255,255,0.05);
+    border-radius: 10px;
+    padding: 10px 12px;
+    margin-bottom: 8px;
+    transition: border-color 0.3s;
+  }
+
+  .other-player.current-turn {
+    border-color: rgba(201,168,76,0.5);
+    background: rgba(201,168,76,0.05);
+    box-shadow: 0 0 12px rgba(201,168,76,0.15);
+  }
+
+  .bust-label {
+    color: var(--red);
+    font-size: 10px;
+    font-family: 'Cinzel', serif;
+    letter-spacing: 1px;
+    margin-left: 4px;
+  }
+
+  .stand-label {
+    color: var(--gold);
+    font-size: 10px;
+    font-family: 'Cinzel', serif;
+    letter-spacing: 1px;
+    margin-left: 4px;
+  }
+
+  .other-result {
+    font-family: 'Cinzel', serif;
+    font-size: 10px;
+    color: var(--gold);
+    margin-left: 4px;
+  }
+
+  /* ===== ACTION AREA ===== */
+  .action-area {
+    padding: 12px 0;
+  }
+
+  .your-turn-msg {
+    font-family: 'Cinzel', serif;
+    font-size: 14px;
+    letter-spacing: 2px;
+    color: var(--gold);
+    text-align: center;
+    margin-bottom: 12px;
+    animation: pulse 1.5s ease-in-out infinite;
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.6; }
+  }
+
+  .waiting-msg {
+    text-align: center;
+    color: rgba(240,230,211,0.5);
+    font-size: 14px;
+    padding: 16px;
+    font-style: italic;
+  }
+
+  .game-over-msg {
+    font-family: 'Cinzel', serif;
+    font-size: 18px;
+    letter-spacing: 3px;
+    color: var(--gold);
+    text-align: center;
+    margin-bottom: 12px;
+  }
+
+  /* ===== SECTIONS ===== */
+  .section-label {
+    font-family: 'Cinzel', serif;
+    font-size: 11px;
+    letter-spacing: 2px;
+    color: rgba(240,230,211,0.4);
+    text-align: center;
+    margin-bottom: 8px;
+    text-transform: uppercase;
+  }
+
+  .others-label {
+    font-family: 'Cinzel', serif;
+    font-size: 11px;
+    letter-spacing: 2px;
+    color: rgba(201,168,76,0.5);
+    text-transform: uppercase;
+    margin-bottom: 6px;
+  }
+
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+
+<!-- HEADER -->
+<div class="header">
+  <h1>♠ BLACKJACK ♥</h1>
+  <div class="room-id-header" id="room-id-header"></div>
+</div>
+
+<!-- LOBBY -->
+<div id="lobby" class="lobby-container">
+  <div class="card-decor">♠ ♥ ♣ ♦</div>
+  <div class="lobby-title">Online Blackjack</div>
+
+  <input class="input-field" id="player-name" type="text" placeholder="あなたの名前" maxlength="12">
+
+  <button class="btn btn-primary" id="create-room-btn" onclick="window._createRoom()">新しいルームを作成</button>
+
+  <div id="room-id-section" class="room-id-section hidden">
+    <div class="room-id-label">ルームID（友達に共有）</div>
+    <div class="room-id-code" id="room-id-display"></div>
+    <button class="btn btn-secondary" onclick="window._copyRoomId()">📋 コピー</button>
+  </div>
+
+  <div class="divider">または</div>
+
+  <div id="join-section">
+    <div class="section-label">ルームに参加</div>
+    <div style="display:flex;gap:8px">
+      <input class="input-field" id="room-code-input" type="text" placeholder="ルームIDを入力" style="flex:1">
+      <button class="btn btn-secondary" style="width:auto;padding:14px 18px;white-space:nowrap" onclick="window._joinRoom()">参加</button>
+    </div>
+  </div>
+
+  <div id="status-msg" class="status-msg"></div>
+</div>
+
+<!-- GAME SCREEN -->
+<div id="game-screen" class="game-screen hidden">
+
+  <!-- ディーラー -->
+  <div class="game-area" id="dealer-area">
+    <div class="area-label">🤖 ディーラー</div>
+  </div>
+
+  <!-- 他プレイヤー -->
+  <div id="others-wrapper">
+    <div class="others-label">👥 他のプレイヤー</div>
+    <div id="others-area"></div>
+  </div>
+
+  <!-- 自分の手札 -->
+  <div class="game-area" id="my-area" style="border-color:rgba(201,168,76,0.35);background:rgba(45,74,26,0.4)">
+    <div class="area-label">👤 あなた</div>
+  </div>
+
+  <!-- アクション -->
+  <div class="action-area" id="action-area"></div>
+
+  <div id="status-msg-game" class="status-msg" style="display:none"></div>
+</div>
+
+</body>
+</html>
